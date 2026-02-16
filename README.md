@@ -1,6 +1,8 @@
-# heartkelp
+![Heartkelp image, with Kril from Another Crab's Treasure](media/kelp.webp)
 
-A Wayland screen-to-GIF recorder for Linux. Select a region or record the full screen, then save it as an animated GIF.
+# 💚 Heartkelp
+
+A Wayland screen-to-GIF recorder for Linux. Record your full screen or a selected region, trim the result, and save as an animated GIF.
 
 ## Dependencies
 
@@ -12,7 +14,7 @@ sudo apt install build-essential libpipewire-0.3-dev libclang-dev pkg-config
 
 ### Rust
 
-Requires Rust 1.85+ (edition 2024). Install via [rustup](https://rustup.rs/) if you don't have it:
+Requires Rust 1.85+ (edition 2024). Install via [rustup](https://rustup.rs/):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -32,26 +34,49 @@ The binary will be at `target/release/heartkelp`.
 cargo run --release
 ```
 
-A GUI window will open with the following controls:
+## Usage
 
-- **Select Region** — takes a screenshot, opens a fullscreen overlay where you drag to select a rectangle
-- **Record Full Screen** — records the entire monitor
-- **Record Region** — records the previously selected region
-- **FPS** slider — frame rate for the GIF (1-30, default 10)
-- **Output** — path for the output GIF file
-- **Stop** — stops recording and encodes the GIF
+### Recording
 
-### Typical workflow
+1. Launch the app. A small floating window appears.
+2. Choose a capture mode:
+   - **Full** — records the entire monitor.
+   - **Region** — records a rectangular area. Click the crop button to take a screenshot and drag a selection on the overlay. A minimap with dimensions shows the selected area.
+3. Click the red record button. Your compositor will show a portal dialog asking to share the screen — accept it.
+4. The app minimizes and a floating control bar appears near the capture area with:
+   - A timer and frame counter.
+   - **Pause/Resume** — temporarily halt capture.
+   - **Stop** — end the recording.
+5. After stopping, the app processes captured frames and opens the review editor.
 
-1. Launch the app
-2. (Optional) Click **Select Region** and drag a rectangle on the overlay
-3. Set the desired FPS and output path
-4. Click **Record Full Screen** or **Record Region**
-5. Your compositor will show a portal dialog asking to share the screen — accept it
-6. Click **Stop** when done
-7. Wait for encoding to finish — the output path will be shown when complete
+### Reviewing and trimming
 
-## How it works
+The review editor shows a preview of the recording with playback controls and a timeline.
+
+- **Play/Pause** — toggle playback of the trimmed region.
+- **Timeline** — click or drag to scrub the playhead.
+- **Trim handles** — drag the orange bracket handles `[` `]` on the timeline to set the start and end points. Areas outside the trim range are dimmed.
+- **Time ruler** — shows timestamps below the timeline for reference.
+
+### Saving
+
+- Click **Save** to encode the trimmed frames as a GIF. Encoding progress is shown inline below the buttons while the editor stays fully interactive.
+- Once saved, a status line appears with the file path and a **Show in Folder** button.
+- You can adjust the trim handles (which clears the saved status) and save again.
+- Click **Close** to return to the idle screen. If you haven't saved yet, a confirmation dialog asks whether to save first.
+
+### Settings
+
+Click the gear icon to open settings:
+
+- **Frames Per Second** — default capture FPS (1-30). Applies to the next recording.
+- **Output Directory** — where GIFs are saved. Browse to change.
+
+Settings are stored in `~/.config/heartkelp/config.toml`.
+
+GIF files are named `heartkelp_YYYY-MM-DD_HH-MM-SS.gif` using UTC time.
+
+## Architecture
 
 ```
 egui GUI ──commands──> Backend thread (tokio + ashpd portals)
@@ -67,15 +92,16 @@ egui GUI ──commands──> Backend thread (tokio + ashpd portals)
                            output.gif
 ```
 
-- **ashpd** handles the XDG Desktop Portal calls for screenshots and screencasting
-- **PipeWire** captures frames from the compositor
-- **gifski** encodes high-quality animated GIFs
+- **ashpd** — XDG Desktop Portal calls for screenshots and screencasting.
+- **PipeWire** — captures frames from the compositor.
+- **gifski** — encodes high-quality animated GIFs.
+- **egui/eframe** — immediate-mode GUI with custom-painted controls.
 
-## Notes
+## Requirements
 
-- Requires a Wayland compositor with XDG Desktop Portal support (GNOME, KDE Plasma, Sway, etc.)
+- A Wayland compositor with XDG Desktop Portal support (GNOME, KDE Plasma, Sway, etc.)
 - X11 is not supported
-- The portal dialog is a security feature — it lets you choose which monitor to share
+- The portal dialog is a security feature — it lets you choose which monitor/window to share
 
 ## License
 
