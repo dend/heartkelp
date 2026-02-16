@@ -1916,6 +1916,7 @@ dependencies = [
  "gifski",
  "image",
  "imgref",
+ "libc",
  "open",
  "pipewire",
  "rfd",

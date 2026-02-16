@@ -2190,25 +2190,16 @@ fn generate_output_path(output_dir: &Path) -> PathBuf {
         .unwrap_or_default()
         .as_secs();
 
-    // Time of day (UTC)
-    let ss = secs % 60;
-    let mm = (secs / 60) % 60;
-    let hh = (secs / 3600) % 24;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let time = secs as libc::time_t;
+    unsafe { libc::localtime_r(&time, &mut tm) };
 
-    // Civil date from days since epoch (Howard Hinnant's algorithm)
-    let z = (secs / 86400) as i64 + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 {
-        yoe as i64 + era * 400 + 1
-    } else {
-        yoe as i64 + era * 400
-    };
+    let y = tm.tm_year + 1900;
+    let mo = tm.tm_mon + 1;
+    let d = tm.tm_mday;
+    let hh = tm.tm_hour;
+    let mm = tm.tm_min;
+    let ss = tm.tm_sec;
 
     output_dir.join(format!(
         "heartkelp_{y:04}-{mo:02}-{d:02}_{hh:02}-{mm:02}-{ss:02}.gif"
