@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.den.heartkelp</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+
+  <name>Heartkelp</name>
+  <summary>Wayland screen-to-GIF recorder</summary>
+
+  <description>
+    <p>A lightweight screen recorder that captures your Wayland desktop and saves it as an animated GIF.</p>
+    <ul>
+      <li>Record specific screen regions or your full display</li>
+      <li>Trim recordings before saving</li>
+      <li>Configurable frame rate and output directory</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">heartkelp.desktop</launchable>
+
+  <url type="homepage">https://github.com/dend/heartkelp</url>
+  <url type="bugtracker">https://github.com/dend/heartkelp/issues</url>
+  <url type="vcs-browser">https://github.com/dend/heartkelp</url>
+
+  <developer id="dev.den">
+    <name>Den Delimarsky</name>
+  </developer>
+
+  <content_rating type="oars-1.1" />
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+</component>
