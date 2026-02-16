@@ -2,7 +2,10 @@
 
 # 💚 Heartkelp
 
-A Wayland screen-to-GIF recorder for Linux. Record your full screen or a selected region, trim the result, and save as an animated GIF.
+A Wayland-compatible screen-to-GIF recorder for Linux. Record your full screen or a selected region, trim the result, and save as an animated GIF.
+
+>[!NOTE]
+>This application is **very much experimental**. There might be things that aren't working properly - if you find something like this, [open an issue](https://github.com/dend/heartkelp/issues).
 
 ## Dependencies
 
