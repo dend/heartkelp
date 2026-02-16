@@ -48,6 +48,10 @@ cargo run --release
 - A Wayland compositor with XDG Desktop Portal support (GNOME, KDE Plasma, Sway)
 - X11 is **not supported**
 
+## Image credit
+
+The image in this README is not the project logo — it's Kril, the hermit crab protagonist of [Another Crab's Treasure](https://aggrocrab.com/ACT) by Aggro Crab. It's a fantastic game and this is my small homage to it.
+
 ## License
 
 AGPL-3.0-or-later
