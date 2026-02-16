@@ -43,7 +43,6 @@ jobs:
           path: target/debian/heartkelp_*.deb
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: target/debian/heartkelp_*.deb
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" target/debian/heartkelp_*.deb --generate-notes
