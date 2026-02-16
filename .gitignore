@@ -24,6 +24,3 @@ target
 # Added by cargo
 
 /target
-
-# While we're testing, let's exclude all GIF files from the stack.
-*.gif

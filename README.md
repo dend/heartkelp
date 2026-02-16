@@ -7,6 +7,8 @@ A Wayland-compatible screen-to-GIF recorder for Linux (primarily developed and t
 >[!NOTE]
 >This application is **very much experimental**. There might be things that aren't working properly - if you find something like this, [open an issue](https://github.com/dend/heartkelp/issues).
 
+![Heartkelp demo on Ubuntu](media/demo.gif)
+
 ## Dependencies
 
 You will need these if you want to build the application locally.
