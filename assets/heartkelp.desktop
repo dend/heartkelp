@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Heartkelp
+Comment=Wayland screen-to-GIF recorder
+Exec=heartkelp
+Icon=heartkelp
+Terminal=false
+Type=Application
+Categories=Utility;Graphics;Video;
+Keywords=screen;record;gif;capture;wayland;screencast;
+StartupWMClass=Heartkelp

@@ -3,6 +3,10 @@ name = "heartkelp"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
+description = "Wayland screen-to-GIF recorder"
+homepage = "https://github.com/dend/heartkelp"
+repository = "https://github.com/dend/heartkelp"
+readme = "README.md"
 
 [dependencies]
 eframe = "0.33"
@@ -20,3 +24,15 @@ toml = "0.8"
 dirs = "6"
 open = "5"
 libc = "0.2"
+
+[package.metadata.deb]
+maintainer = "Den Delimarsky"
+depends = "libpipewire-0.3-0, xdg-desktop-portal"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/heartkelp", "usr/bin/", "755"],
+    ["assets/heartkelp.desktop", "usr/share/applications/", "644"],
+    ["media/kelp.png", "usr/share/icons/hicolor/128x128/apps/heartkelp.png", "644"],
+    ["README.md", "usr/share/doc/heartkelp/README.md", "644"],
+]
