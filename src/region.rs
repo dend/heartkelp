@@ -292,22 +292,31 @@ impl SelectorState {
                 egui::Color32::WHITE,
             );
 
-            // Pre-load a previous region (physical → logical conversion)
+            // Pre-load a previous region (physical → logical conversion).
+            // Only convert once the viewport has reached its fullscreen
+            // size (window points × ppp == screenshot pixels): the first
+            // frames may still be at the pre-fullscreen default size,
+            // which would bake in a wrong scale and place the rectangle
+            // off-target.
             if let Some((rx, ry, rw, rh)) = self.initial_region {
                 let ppp = ctx.pixels_per_point();
-                let sx = tex_size.x / available.x;
-                let sy = tex_size.y / available.y;
-                self.pending_rect = Some(egui::Rect::from_min_size(
-                    egui::pos2(
-                        rx as f32 / (ppp * sx),
-                        ry as f32 / (ppp * sy),
-                    ),
-                    egui::vec2(
-                        rw as f32 / (ppp * sx),
-                        rh as f32 / (ppp * sy),
-                    ),
-                ));
-                self.initial_region = None;
+                if (available.x * ppp - tex_size.x).abs() < 2.0
+                    && (available.y * ppp - tex_size.y).abs() < 2.0
+                {
+                    let sx = tex_size.x / available.x;
+                    let sy = tex_size.y / available.y;
+                    self.pending_rect = Some(egui::Rect::from_min_size(
+                        egui::pos2(
+                            rx as f32 / (ppp * sx),
+                            ry as f32 / (ppp * sy),
+                        ),
+                        egui::vec2(
+                            rw as f32 / (ppp * sx),
+                            rh as f32 / (ppp * sy),
+                        ),
+                    ));
+                    self.initial_region = None;
+                }
             }
 
             // Handle drag interaction (disabled during confirmation)
