@@ -63,6 +63,7 @@ const MARGIN_H: f32 = 16.0;     // horizontal panel margin
 const MARGIN_V: f32 = 12.0;     // vertical panel margin
 const CLOSE_SIZE: f32 = 20.0;   // title-bar close button hit area
 const PROGRESS_W: f32 = 200.0;  // encoding progress bar width
+const MINIMAP_W: f32 = 140.0;   // idle minimap width
 const PROGRESS_H: f32 = 6.0;    // encoding progress bar height
 const REVIEW_CONTROLS_H: f32 = 164.0; // playback row + timeline + buttons + spacing + bottom pad
 
@@ -77,6 +78,7 @@ pub struct App {
     recording_start: Option<Instant>,
     last_error: Option<String>,
     screen_size: Option<(u32, u32)>,
+    screen_thumb: Option<egui::TextureHandle>,
     use_region: bool,
     paused: bool,
     pause_start: Option<Instant>,
@@ -137,6 +139,7 @@ impl App {
             recording_start: None,
             last_error: None,
             screen_size: None,
+            screen_thumb: None,
             use_region: false,
             paused: false,
             pause_start: None,
@@ -215,6 +218,13 @@ impl eframe::App for App {
                 Event::ScreenshotReady(image) => {
                     self.screen_size =
                         Some((image.size[0] as u32, image.size[1] as u32));
+                    // Keep a downscaled copy for the idle minimap
+                    let thumb = downscale_image(&image, 560);
+                    self.screen_thumb = Some(ctx.load_texture(
+                        "screen_thumb",
+                        thumb,
+                        egui::TextureOptions::LINEAR,
+                    ));
                     self.region_selector.set_screenshot(image);
                     self.state = RecordingState::SelectingRegion;
                 }
@@ -475,7 +485,7 @@ impl App {
         let mut target_h = TITLE_H + MARGIN_V * 2.0 + BTN + 2.0;
         if has_minimap {
             let (sw, sh) = self.screen_size.unwrap_or((1920, 1080));
-            let map_h = 100.0 * sh as f32 / sw as f32;
+            let map_h = MINIMAP_W * sh as f32 / sw as f32;
             target_h += GAP + map_h + GAP_SM + 16.0;
         }
         if has_error {
@@ -711,11 +721,15 @@ impl App {
             }
         });
 
-        // Region minimap + dimensions
+        // Region minimap: screenshot thumbnail with the zone spotlighted.
+        // This is the persistent "where is my selection" indicator — a
+        // floating on-screen outline is impossible on GNOME Wayland (no
+        // transparency on this stack, no window positioning, no
+        // always-on-top), so the minimap carries that job.
         if self.use_region {
             if let Some((rx, ry, rw, rh)) = self.selected_region {
                 let (sw, sh) = self.screen_size.unwrap_or((1920, 1080));
-                let map_w = 100.0_f32;
+                let map_w = MINIMAP_W;
                 let map_h = map_w * sh as f32 / sw as f32;
 
                 ui.add_space(GAP_SM);
@@ -725,13 +739,20 @@ impl App {
                 );
                 let painter = ui.painter();
 
-                // Screen outline
-                painter.rect_stroke(
-                    map_rect,
-                    2.0,
-                    egui::Stroke::new(1.0, CONTROL_HV),
-                    egui::StrokeKind::Inside,
-                );
+                // Screen thumbnail (falls back to a flat surface)
+                if let Some(tex) = &self.screen_thumb {
+                    painter.image(
+                        tex.id(),
+                        map_rect,
+                        egui::Rect::from_min_max(
+                            egui::pos2(0.0, 0.0),
+                            egui::pos2(1.0, 1.0),
+                        ),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    painter.rect_filled(map_rect, 2.0, SURFACE);
+                }
 
                 // Selected region (scaled to minimap)
                 let sx = map_w / sw as f32;
@@ -743,15 +764,52 @@ impl App {
                     ),
                     egui::vec2(rw as f32 * sx, rh as f32 * sy),
                 );
+
+                // Dim everything outside the zone (four edge strips)
+                let dim = egui::Color32::from_black_alpha(150);
                 painter.rect_filled(
-                    sel_rect,
+                    egui::Rect::from_min_max(
+                        map_rect.min,
+                        egui::pos2(map_rect.max.x, sel_rect.min.y),
+                    ),
                     0.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 25),
+                    dim,
                 );
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(map_rect.min.x, sel_rect.max.y),
+                        map_rect.max,
+                    ),
+                    0.0,
+                    dim,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(map_rect.min.x, sel_rect.min.y),
+                        egui::pos2(sel_rect.min.x, sel_rect.max.y),
+                    ),
+                    0.0,
+                    dim,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(sel_rect.max.x, sel_rect.min.y),
+                        egui::pos2(map_rect.max.x, sel_rect.max.y),
+                    ),
+                    0.0,
+                    dim,
+                );
+
                 painter.rect_stroke(
                     sel_rect,
                     0.0,
-                    egui::Stroke::new(1.0, egui::Color32::WHITE),
+                    egui::Stroke::new(1.5, egui::Color32::WHITE),
+                    egui::StrokeKind::Inside,
+                );
+                painter.rect_stroke(
+                    map_rect,
+                    2.0,
+                    egui::Stroke::new(1.0, CONTROL_HV),
                     egui::StrokeKind::Inside,
                 );
 
@@ -2028,6 +2086,24 @@ impl App {
             fps: self.fps,
         });
     }
+}
+
+/// Nearest-neighbor downscale for the minimap thumbnail.
+fn downscale_image(img: &egui::ColorImage, target_w: usize) -> egui::ColorImage {
+    let [w, h] = img.size;
+    if w <= target_w {
+        return img.clone();
+    }
+    let target_h = (h * target_w / w).max(1);
+    let mut pixels = Vec::with_capacity(target_w * target_h);
+    for y in 0..target_h {
+        let sy = y * h / target_h;
+        for x in 0..target_w {
+            let sx = x * w / target_w;
+            pixels.push(img.pixels[sy * w + sx]);
+        }
+    }
+    egui::ColorImage::new([target_w, target_h], pixels)
 }
 
 fn generate_output_path(output_dir: &Path) -> PathBuf {
