@@ -50,4 +50,8 @@ pub struct Frame {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// Seconds since capture start. Capture is damage-driven and lossy, so
+    /// frames are not uniformly spaced — the encoder must use these
+    /// timestamps, not an assumed fixed frame rate.
+    pub pts: f64,
 }

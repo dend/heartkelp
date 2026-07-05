@@ -77,7 +77,6 @@ pub struct App {
     recording_start: Option<Instant>,
     last_error: Option<String>,
     screen_size: Option<(u32, u32)>,
-    active_mode: Option<CaptureMode>,
     use_region: bool,
     paused: bool,
     pause_start: Option<Instant>,
@@ -99,6 +98,15 @@ pub struct App {
     review_saved_path: Option<PathBuf>,
     // Deferred screenshot (wait for highlight viewport to disappear)
     pending_screenshot: Option<Instant>,
+    // Last values sent as viewport commands. Commands must only be sent on
+    // change: each one schedules a repaint, so sending every frame creates
+    // an unthrottled repaint loop (vsync is off) that floods the Wayland
+    // connection until the compositor disconnects us.
+    sent_window_size: Option<egui::Vec2>,
+    // Frame limiter — with vsync off nothing else bounds the repaint rate
+    // (a 1000 Hz mouse means 1000 repaints/s), and unbounded repaints
+    // flood the Wayland connection until the compositor drops us.
+    last_frame_at: Option<Instant>,
     // Settings
     show_settings: bool,
     config: Config,
@@ -129,7 +137,6 @@ impl App {
             recording_start: None,
             last_error: None,
             screen_size: None,
-            active_mode: None,
             use_region: false,
             paused: false,
             pause_start: None,
@@ -149,6 +156,8 @@ impl App {
             encoding_total_frames: 0,
             review_saved_path: None,
             pending_screenshot: None,
+            sent_window_size: None,
+            last_frame_at: None,
             show_settings: false,
             config,
             settings_fps: fps,
@@ -172,6 +181,17 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Cap at ~144 fps (see last_frame_at). Also covers the immediate
+        // child viewports, which render inside this update.
+        if let Some(last) = self.last_frame_at {
+            let min_interval = Duration::from_micros(6900);
+            let elapsed = last.elapsed();
+            if elapsed < min_interval {
+                std::thread::sleep(min_interval - elapsed);
+            }
+        }
+        self.last_frame_at = Some(Instant::now());
+
         if self.first_frame {
             self.first_frame = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -183,7 +203,7 @@ impl eframe::App for App {
                 self.pending_screenshot = None;
                 let _ = self.cmd_tx.send(Command::TakeScreenshot);
             } else {
-                ctx.request_repaint();
+                ctx.request_repaint_after(Duration::from_millis(16));
             }
         }
 
@@ -237,7 +257,6 @@ impl eframe::App for App {
                     self.encoding_in_progress = false;
                     self.state = RecordingState::Idle;
                     self.recording_start = None;
-                    self.active_mode = None;
                     self.paused = false;
                     self.pause_start = None;
                 }
@@ -282,7 +301,7 @@ impl eframe::App for App {
             } else {
                 self.review_last_tick = Some(now);
             }
-            ctx.request_repaint();
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
 
         // Handle state transitions
@@ -290,16 +309,16 @@ impl eframe::App for App {
             self.apply_state_transition(ctx, &state_before);
         }
 
-        // During recording, main window is passthrough — controls are in a separate viewport
-        let recording = self.state == RecordingState::Recording;
-        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(recording));
-
         self.region_selector.show(ctx);
-        self.show_region_highlight(ctx);
         self.show_title_bar(ctx);
 
+        // During recording the main window is the controls bar (see
+        // show_recording_ui) with the same frame style the old floating
+        // controls viewport had.
         let panel_frame = if self.state == RecordingState::Recording {
             egui::Frame::NONE
+                .fill(BG)
+                .inner_margin(egui::Margin::symmetric(MARGIN_V as i8, 8))
         } else {
             egui::Frame::NONE
                 .fill(BG)
@@ -333,35 +352,44 @@ impl eframe::App for App {
             self.show_settings_viewport(ctx);
         }
     }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Every state paints an opaque panel over the whole window, so the
+        // clear color is never actually visible. Window transparency does
+        // not work on this stack anyway (NVIDIA EGL + Wayland renders
+        // "transparent" as opaque black) — never design UI that relies on
+        // a see-through surface.
+        egui::Rgba::TRANSPARENT.to_array()
+    }
 }
 
 impl App {
+    /// Request a main-window size, deduplicated — see `sent_window_size`.
+    fn set_window_size(&mut self, ctx: &egui::Context, size: egui::Vec2) {
+        if self
+            .sent_window_size
+            .is_none_or(|s| (s - size).length_sq() > 0.25)
+        {
+            self.sent_window_size = Some(size);
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+    }
+
     fn apply_state_transition(
-        &self,
+        &mut self,
         ctx: &egui::Context,
-        prev: &RecordingState,
+        _prev: &RecordingState,
     ) {
-        match (&self.state, prev) {
-            (RecordingState::Recording, _) => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            }
-            (RecordingState::Reviewing, _) => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                    egui::vec2(WIN_W_REVIEW, 545.0),
-                ));
+        // The main window is never minimized while recording: on Wayland a
+        // minimized window stops receiving frame callbacks, which would
+        // halt update() entirely. Instead it becomes the recording
+        // controls bar (see show_recording_ui).
+        match &self.state {
+            RecordingState::Reviewing => {
+                self.set_window_size(ctx, egui::vec2(WIN_W_REVIEW, 545.0));
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                     egui::WindowLevel::Normal,
                 ));
-            }
-            (
-                RecordingState::Idle,
-                RecordingState::Encoding
-                | RecordingState::Recording
-                | RecordingState::Reviewing,
-            ) => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                // Size will be set by show_idle_ui based on minimap visibility
             }
             _ => {}
         }
@@ -453,9 +481,8 @@ impl App {
         if has_error {
             target_h += GAP + 16.0;
         }
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(
-            egui::vec2(WIN_W, target_h),
-        ));
+        let ctx = ui.ctx().clone();
+        self.set_window_size(&ctx, egui::vec2(WIN_W, target_h));
 
         // Controls row: [Full|Region] [crop] [record] [gear]
         let content_w = 92.0 + BTN * 3.0 + GAP * 3.0;
@@ -631,19 +658,7 @@ impl App {
                 if can_record && resp.clicked() {
                     if self.use_region {
                         let (x, y, w, h) = self.selected_region.unwrap();
-                        // Inset by border width so the dashed highlight
-                        // overlay doesn't appear in the captured frames.
-                        let inset: i32 = 4;
-                        let ix = x + inset;
-                        let iy = y + inset;
-                        let iw = w.saturating_sub(2 * inset as u32);
-                        let ih = h.saturating_sub(2 * inset as u32);
-                        self.start_recording(CaptureMode::Region {
-                            x: ix,
-                            y: iy,
-                            w: iw,
-                            h: ih,
-                        });
+                        self.start_recording(CaptureMode::Region { x, y, w, h });
                     } else {
                         self.start_recording(CaptureMode::FullScreen);
                     }
@@ -753,10 +768,9 @@ impl App {
         }
     }
 
-    fn show_selecting_ui(&self, ui: &mut egui::Ui) {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(
-            egui::vec2(WIN_W * 0.7, TITLE_H + BTN),
-        ));
+    fn show_selecting_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.set_window_size(&ctx, egui::vec2(WIN_W * 0.7, TITLE_H + BTN));
         ui.label(
             egui::RichText::new("Selecting region...")
                 .size(FONT_SM)
@@ -765,9 +779,14 @@ impl App {
     }
 
     fn show_recording_ui(&mut self, ui: &mut egui::Ui) {
-        // Extract state for the viewport closure (can't capture &mut self)
+        // The main window IS the controls bar while recording. A separate
+        // transparent child viewport cannot work on this stack: window
+        // transparency renders opaque black (NVIDIA EGL + Wayland glow),
+        // and Wayland ignores client window positioning anyway.
+        let ctx = ui.ctx().clone();
+        self.set_window_size(&ctx, egui::vec2(268.0, 78.0));
+
         let paused = self.paused;
-        let frame_count = self.frame_count;
         let elapsed = self.active_duration();
         let secs = elapsed.as_secs();
         let timer_text = format!(
@@ -776,275 +795,139 @@ impl App {
             secs % 60,
             elapsed.subsec_millis() / 100
         );
-        let frame_text = format!("{}", frame_count);
+        let frame_text = format!("{}", self.frame_count);
 
         let mut should_stop = false;
         let mut should_toggle_pause = false;
 
-        // Compute viewport position near the recording region
-        let win_w = 268.0_f32;
-        let win_h = 60.0_f32;
-        let viewport_pos = if let Some(CaptureMode::Region {
-            x,
-            y,
-            w: rw,
-            h,
-        }) = &self.active_mode
-        {
-            let gap = 12.0_f32;
-            let (screen_w, screen_h) = self
-                .screen_size
-                .map_or((1920.0, 1080.0), |(w, h)| (w as f32, h as f32));
-            let region_bottom = *y as f32 + *h as f32;
-            let region_right = *x as f32 + *rw as f32;
-            let below_y = region_bottom + gap;
-
-            if below_y + win_h <= screen_h {
-                Some(egui::pos2(*x as f32, below_y))
-            } else if *y as f32 - win_h - gap >= 0.0 {
-                Some(egui::pos2(
-                    *x as f32,
-                    *y as f32 - win_h - gap,
-                ))
-            } else if region_right + gap + win_w <= screen_w {
-                Some(egui::pos2(region_right + gap, *y as f32))
-            } else if *x as f32 - win_w - gap >= 0.0 {
-                Some(egui::pos2(*x as f32 - win_w - gap, *y as f32))
-            } else {
-                Some(egui::pos2(screen_w - win_w - 20.0, screen_h - win_h - 20.0))
-            }
-        } else {
-            None
-        };
-
-        let viewport_id =
-            egui::ViewportId::from_hash_of("recording_controls");
-
-        let mut builder = egui::ViewportBuilder::default()
-            .with_title("Recording")
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_resizable(false)
-            .with_inner_size(egui::vec2(win_w, win_h));
-
-        if let Some(pos) = viewport_pos {
-            builder = builder.with_position(pos);
+        // Full-area drag handle
+        let full_rect = ui.max_rect();
+        let drag_resp = ui.interact(
+            full_rect,
+            ui.id().with("controls_drag"),
+            egui::Sense::drag(),
+        );
+        if drag_resp.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
 
-        ui.ctx().show_viewport_immediate(
-            viewport_id,
-            builder,
-            |ctx, _class| {
-                let panel_frame = egui::Frame::NONE
-                    .fill(BG)
-                    .inner_margin(egui::Margin::symmetric(MARGIN_V as i8, 8));
+        // Drag grip dots
+        let grip_x = full_rect.left() + 6.0;
+        let grip_cy = full_rect.center().y;
+        for i in -1..=1 {
+            ui.painter().circle_filled(
+                egui::pos2(grip_x, grip_cy + i as f32 * 5.0),
+                1.5,
+                TEXT_DISABLED,
+            );
+        }
 
-                egui::CentralPanel::default()
-                    .frame(panel_frame)
-                    .show(ctx, |ui| {
-                        // Full-area drag handle
-                        let full_rect = ui.max_rect();
-                        let drag_resp = ui.interact(
-                            full_rect,
-                            ui.id().with("controls_drag"),
-                            egui::Sense::drag(),
-                        );
-                        if drag_resp.drag_started() {
-                            ctx.send_viewport_cmd(
-                                egui::ViewportCommand::StartDrag,
-                            );
-                        }
+        let timer_w = 60.0;
+        let content_w = 14.0 + timer_w + 52.0 + BTN + BTN + GAP * 4.0;
 
-                        // Drag grip dots
-                        let grip_x = full_rect.left() + 6.0;
-                        let grip_cy = full_rect.center().y;
-                        for i in -1..=1 {
-                            ui.painter().circle_filled(
-                                egui::pos2(grip_x, grip_cy + i as f32 * 5.0),
-                                1.5,
-                                TEXT_DISABLED,
-                            );
-                        }
+        ui.with_layout(
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = GAP;
+                let pad = (ui.available_width() - content_w).max(0.0) / 2.0;
+                ui.add_space(pad);
 
-                        let timer_w = 60.0;
-                        let content_w = 14.0 + timer_w + 52.0 + BTN
-                            + BTN
-                            + GAP * 4.0;
+                // Pulsing/static dot
+                let (dot_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(14.0, BTN),
+                    egui::Sense::hover(),
+                );
+                let dot_color = if paused {
+                    PAUSE_DOT
+                } else {
+                    let time = ui.input(|i| i.time);
+                    let alpha = ((time * 3.0).sin() * 0.4 + 0.6) as f32;
+                    egui::Color32::from_rgba_unmultiplied(
+                        255,
+                        50,
+                        50,
+                        (alpha * 255.0) as u8,
+                    )
+                };
+                ui.painter().circle_filled(dot_rect.center(), 5.0, dot_color);
 
-                        ui.with_layout(
-                            egui::Layout::left_to_right(
-                                egui::Align::Center,
-                            ),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = GAP;
-                                let pad = (ui.available_width()
-                                    - content_w)
-                                    .max(0.0)
-                                    / 2.0;
-                                ui.add_space(pad);
+                // Timer
+                let (timer_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(timer_w, BTN),
+                    egui::Sense::hover(),
+                );
+                ui.painter().text(
+                    timer_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &timer_text,
+                    egui::FontId::monospace(FONT_LG),
+                    TEXT_PRIMARY,
+                );
 
-                                // Pulsing/static dot
-                                let (dot_rect, _) =
-                                    ui.allocate_exact_size(
-                                        egui::vec2(14.0, BTN),
-                                        egui::Sense::hover(),
-                                    );
-                                let dot_color = if paused {
-                                    PAUSE_DOT
-                                } else {
-                                    let time =
-                                        ui.input(|i| i.time);
-                                    let alpha = ((time * 3.0).sin()
-                                        * 0.4
-                                        + 0.6)
-                                        as f32;
-                                    egui::Color32::from_rgba_unmultiplied(
-                                        255,
-                                        50,
-                                        50,
-                                        (alpha * 255.0) as u8,
-                                    )
-                                };
-                                ui.painter().circle_filled(
-                                    dot_rect.center(),
-                                    5.0,
-                                    dot_color,
-                                );
+                // Frame count pill
+                let pill_w = 52.0;
+                let (pill_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(pill_w, BTN),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    pill_rect.shrink2(egui::vec2(0.0, 4.0)),
+                    RADIUS_PILL,
+                    ACCENT_BG,
+                );
+                ui.painter().text(
+                    pill_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &frame_text,
+                    egui::FontId::monospace(FONT_MD),
+                    ACCENT,
+                );
 
-                                // Timer
-                                let (timer_rect, _) =
-                                    ui.allocate_exact_size(
-                                        egui::vec2(timer_w, BTN),
-                                        egui::Sense::hover(),
-                                    );
-                                ui.painter().text(
-                                    timer_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    &timer_text,
-                                    egui::FontId::monospace(FONT_LG),
-                                    TEXT_PRIMARY,
-                                );
+                // Pause/Resume button
+                {
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(BTN, BTN),
+                        egui::Sense::click(),
+                    );
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if paused {
+                        let bg = if resp.hovered() { GREEN_HV } else { GREEN };
+                        ui.painter().rect_filled(rect, RADIUS, bg);
+                        paint_play_icon(ui.painter(), rect, TEXT_PRIMARY);
+                    } else {
+                        let bg = if resp.hovered() { CONTROL_HV } else { CONTROL };
+                        ui.painter().rect_filled(rect, RADIUS, bg);
+                        paint_pause_icon(ui.painter(), rect, TEXT_PRIMARY);
+                    }
+                    if resp.clicked() {
+                        should_toggle_pause = true;
+                    }
+                    resp.on_hover_text(if paused { "Resume" } else { "Pause" });
+                }
 
-                                // Frame count pill
-                                let pill_w = 52.0;
-                                let (pill_rect, _) =
-                                    ui.allocate_exact_size(
-                                        egui::vec2(pill_w, BTN),
-                                        egui::Sense::hover(),
-                                    );
-                                ui.painter().rect_filled(
-                                    pill_rect.shrink2(egui::vec2(
-                                        0.0, 4.0,
-                                    )),
-                                    RADIUS_PILL,
-                                    ACCENT_BG,
-                                );
-                                ui.painter().text(
-                                    pill_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    &frame_text,
-                                    egui::FontId::monospace(FONT_MD),
-                                    ACCENT,
-                                );
-
-                                // Pause/Resume button
-                                {
-                                    let (rect, resp) =
-                                        ui.allocate_exact_size(
-                                            egui::vec2(BTN, BTN),
-                                            egui::Sense::click(),
-                                        );
-                                    if resp.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    if paused {
-                                        let bg = if resp.hovered() {
-                                            GREEN_HV
-                                        } else {
-                                            GREEN
-                                        };
-                                        ui.painter().rect_filled(
-                                            rect, RADIUS, bg,
-                                        );
-                                        paint_play_icon(
-                                            ui.painter(),
-                                            rect,
-                                            TEXT_PRIMARY,
-                                        );
-                                    } else {
-                                        let bg = if resp.hovered() {
-                                            CONTROL_HV
-                                        } else {
-                                            CONTROL
-                                        };
-                                        ui.painter().rect_filled(
-                                            rect, RADIUS, bg,
-                                        );
-                                        paint_pause_icon(
-                                            ui.painter(),
-                                            rect,
-                                            TEXT_PRIMARY,
-                                        );
-                                    }
-                                    // Detect press directly — in child viewports on
-                                    // Wayland the first focus-click can miss `clicked()`.
-                                    let pressed_here = resp.rect.contains(
-                                        ui.input(|i| i.pointer.interact_pos().unwrap_or_default())
-                                    ) && ui.input(|i| i.pointer.any_pressed());
-                                    if resp.clicked() || pressed_here {
-                                        should_toggle_pause = true;
-                                    }
-                                    resp.on_hover_text(if paused {
-                                        "Resume"
-                                    } else {
-                                        "Pause"
-                                    });
-                                }
-
-                                // Stop button
-                                {
-                                    let (rect, resp) =
-                                        ui.allocate_exact_size(
-                                            egui::vec2(BTN, BTN),
-                                            egui::Sense::click(),
-                                        );
-                                    if resp.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    let bg = if resp.hovered() {
-                                        RED_HV
-                                    } else {
-                                        RED
-                                    };
-                                    ui.painter().rect_filled(
-                                        rect, RADIUS, bg,
-                                    );
-                                    let sq =
-                                        egui::Rect::from_center_size(
-                                            rect.center(),
-                                            egui::vec2(10.0, 10.0),
-                                        );
-                                    ui.painter().rect_filled(
-                                        sq,
-                                        2.0,
-                                        TEXT_PRIMARY,
-                                    );
-                                    let pressed_here = resp.rect.contains(
-                                        ui.input(|i| i.pointer.interact_pos().unwrap_or_default())
-                                    ) && ui.input(|i| i.pointer.any_pressed());
-                                    if resp.clicked() || pressed_here {
-                                        should_stop = true;
-                                    }
-                                    resp.on_hover_text(
-                                        "Stop Recording",
-                                    );
-                                }
-                            },
-                        );
-                    });
-
-                ctx.request_repaint();
+                // Stop button
+                {
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(BTN, BTN),
+                        egui::Sense::click(),
+                    );
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    let bg = if resp.hovered() { RED_HV } else { RED };
+                    ui.painter().rect_filled(rect, RADIUS, bg);
+                    let sq = egui::Rect::from_center_size(
+                        rect.center(),
+                        egui::vec2(10.0, 10.0),
+                    );
+                    ui.painter().rect_filled(sq, 2.0, TEXT_PRIMARY);
+                    if resp.clicked() {
+                        should_stop = true;
+                    }
+                    resp.on_hover_text("Stop Recording");
+                }
             },
         );
 
@@ -1069,15 +952,16 @@ impl App {
             }
         }
 
-        ui.ctx().request_repaint();
+        ui.ctx().request_repaint_after(Duration::from_millis(33));
     }
 
-    fn show_encoding_ui(&self, ui: &mut egui::Ui) {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(
-            egui::vec2(WIN_W, 120.0),
-        ));
+    fn show_encoding_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.set_window_size(&ctx, egui::vec2(WIN_W, 120.0));
 
-        ui.spinner();
+        // No ui.spinner() here: it requests an unthrottled repaint every
+        // frame it is drawn, which spins with vsync off. The progress bar
+        // below is the encoding indicator.
         ui.add_space(GAP_SM);
         ui.label(
             egui::RichText::new(format!(
@@ -1102,7 +986,7 @@ impl App {
             ui.painter().rect_filled(fill_rect, RADIUS_SM, GREEN);
         }
 
-        ui.ctx().request_repaint();
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
 
     fn show_reviewing_ui(&mut self, ui: &mut egui::Ui) {
@@ -1137,11 +1021,14 @@ impl App {
             .collect();
         let image = egui::ColorImage::new([fw, fh], pixels);
 
-        let tex = self.review_texture.get_or_insert_with(|| {
-            ui.ctx()
-                .load_texture("review_preview", image.clone(), egui::TextureOptions::LINEAR)
-        });
-        tex.set(image, egui::TextureOptions::LINEAR);
+        let tex_id = {
+            let tex = self.review_texture.get_or_insert_with(|| {
+                ui.ctx()
+                    .load_texture("review_preview", image.clone(), egui::TextureOptions::LINEAR)
+            });
+            tex.set(image, egui::TextureOptions::LINEAR);
+            tex.id()
+        };
 
         // Scale preview to fit, then size the window to match
         let controls_h = REVIEW_CONTROLS_H;
@@ -1160,14 +1047,13 @@ impl App {
             0.0
         };
         let target_h = TITLE_H + MARGIN_V * 2.0 + preview_h + controls_h + status_h;
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(
-            egui::vec2(WIN_W_REVIEW, target_h),
-        ));
+        let ctx = ui.ctx().clone();
+        self.set_window_size(&ctx, egui::vec2(WIN_W_REVIEW, target_h));
 
         let (preview_rect, _) =
             ui.allocate_exact_size(egui::vec2(preview_w, preview_h), egui::Sense::hover());
         ui.painter().image(
-            tex.id(),
+            tex_id,
             preview_rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
@@ -1626,7 +1512,7 @@ impl App {
                 );
                 ui.painter().rect_filled(fill_rect, RADIUS_SM, GREEN);
             }
-            ui.ctx().request_repaint();
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         } else if let Some(path) = &self.review_saved_path.clone() {
             ui.add_space(GAP_LG);
 
@@ -2089,7 +1975,6 @@ impl App {
         self.review_saved_path = None;
         self.state = RecordingState::Idle;
         self.recording_start = None;
-        self.active_mode = None;
         self.paused = false;
         self.pause_start = None;
         self.show_settings = false;
@@ -2122,59 +2007,12 @@ impl App {
         self.review_saved_path = None;
     }
 
-    fn show_region_highlight(&self, ctx: &egui::Context) {
-        // Show in idle and recording, when region mode is active, a region is
-        // selected, and the overlay is not open.
-        if !matches!(self.state, RecordingState::Idle | RecordingState::Recording)
-            || !self.use_region
-            || self.region_selector.is_open()
-        {
-            return;
-        }
-        let Some((rx, ry, rw, rh)) = self.selected_region else {
-            return;
-        };
-
-        let viewport_id =
-            egui::ViewportId::from_hash_of("region_highlight");
-
-        ctx.show_viewport_immediate(
-            viewport_id,
-            egui::ViewportBuilder::default()
-                .with_title("Region")
-                .with_decorations(false)
-                .with_transparent(true)
-                .with_always_on_top()
-                .with_mouse_passthrough(true)
-                .with_resizable(false)
-                .with_position(egui::pos2(rx as f32, ry as f32))
-                .with_inner_size(egui::vec2(rw as f32, rh as f32)),
-            |ctx, _class| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let rect = ui.max_rect();
-                        crate::region::draw_dashed_rect(
-                            ui.painter(),
-                            rect,
-                            egui::Color32::WHITE,
-                            egui::Color32::from_black_alpha(100),
-                            2.0,
-                            6.0,
-                            4.0,
-                        );
-                    });
-            },
-        );
-    }
-
     fn start_recording(&mut self, mode: CaptureMode) {
         self.last_error = None;
         self.frame_count = 0;
         self.paused = false;
         self.pause_start = None;
         self.paused_duration = Duration::ZERO;
-        self.active_mode = Some(mode.clone());
         self.show_settings = false;
 
         let _ = self.cmd_tx.send(Command::StartRecording {

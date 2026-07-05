@@ -10,7 +10,7 @@ use crate::types::{Event, Frame};
 
 pub fn encode_frames(
     frames: Vec<Frame>,
-    fps: u8,
+    _fps: u8,
     start: usize,
     end: usize,
     width: Option<u32>,
@@ -38,7 +38,11 @@ pub fn encode_frames(
         writer.write(file, &mut gifski::progress::NoProgress {})
     });
 
-    let frame_delay = 1.0 / fps as f64;
+    // Use real capture timestamps: delivery is damage-driven and lossy, so
+    // assuming uniform frame spacing would time-compress every gap into a
+    // visible jump.
+    let base_pts = frames[start].pts;
+    let mut last_ts = f64::NEG_INFINITY;
 
     for (i, frame) in frames[start..end].iter().enumerate() {
         let pixels: Vec<RGBA8> = frame
@@ -48,7 +52,12 @@ pub fn encode_frames(
             .collect();
 
         let img = ImgVec::new(pixels, frame.width as usize, frame.height as usize);
-        let timestamp = i as f64 * frame_delay;
+        // gifski requires strictly increasing timestamps
+        let mut timestamp = frame.pts - base_pts;
+        if timestamp <= last_ts {
+            timestamp = last_ts + 0.001;
+        }
+        last_ts = timestamp;
 
         if collector.add_frame_rgba(i, img, timestamp).is_err() {
             break;

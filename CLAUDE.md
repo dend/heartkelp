@@ -48,7 +48,16 @@ The UI is entirely custom-painted using egui's painter API — no standard widge
 - **Button pattern** — `allocate_exact_size` → `interact` → paint background rect → paint label text → handle click.
 - **Centering** — compute total content width, add `(avail - total) / 2` padding at the start of a `ui.horizontal`.
 - **Window sizing** — `send_viewport_cmd(InnerSize(...))` called each frame based on visible content.
-- **Child viewports** — recording controls and settings use `show_viewport_immediate` for separate OS windows.
+- **Child viewports** — settings uses `show_viewport_immediate`; the region selector uses `show_viewport_deferred` with `Arc<Mutex>` state (its fullscreen overlay occludes the main window, and an immediate viewport would freeze with it on Wayland). The recording controls are NOT a child viewport — the main window becomes the controls bar during recording.
+
+### Wayland constraints (verified on GNOME + NVIDIA; see `examples/freeze_probe.rs`, `examples/transparency_probe2.rs`)
+- **Window transparency does not work** on this stack: eframe glow + NVIDIA EGL renders "transparent" surfaces as opaque black (verified by screenshot probe). Never design UI relying on a see-through window. This is why there is no dashed region-highlight overlay and why the recording controls live in the main window.
+- **Window positioning is ignored** (`with_position` does nothing on Wayland) — never place a window at screen coordinates; draw at coordinates inside a window instead, or don't.
+- Mutter revokes fullscreen from windows created with `with_active(false)` (~40 ms after granting it). Enabling mouse passthrough on a focused window is fine.
+- Never minimize/hide the main window while a child viewport must stay live — occluded/unmapped surfaces stop getting frame callbacks, which stalls immediate viewports.
+- vsync is off (`main.rs`) because NVIDIA's EGL blocks `SwapBuffers` indefinitely for occluded surfaces. Consequences: never call bare `request_repaint()` in a per-frame loop (use `request_repaint_after(...)`); egui animations are disabled (`animation_time = 0`) and `ui.spinner()` is banned — both request unthrottled repaints; a ~144 fps sleep cap guards `App::update` and the region overlay as the backstop.
+- Send viewport commands (`InnerSize`, `MousePassthrough`, …) only when the value changes (`set_window_size`, `sent_passthrough`). Each command schedules a repaint, so unconditional per-frame sends create a repaint loop that floods the Wayland socket until GNOME silently disconnects the app (broken pipe, exit 1, no protocol error).
+- A deferred child viewport must close itself (`ViewportCommand::Close` + `request_repaint_of(ROOT)`) because its occluded parent may be paused and unable to retire it.
 
 ## Key API Notes
 

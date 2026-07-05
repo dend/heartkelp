@@ -238,6 +238,7 @@ fn run_pipewire_capture(
     let mode2 = mode.clone();
     let frame_interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
     let mut next_frame_time = std::time::Instant::now();
+    let record_start = std::time::Instant::now();
 
     let _listener = stream
         .add_local_listener::<()>()
@@ -271,6 +272,7 @@ fn run_pipewire_capture(
             }
 
             if let Some(mut buffer) = stream.dequeue_buffer() {
+                let pts = record_start.elapsed().as_secs_f64();
                 let datas = buffer.datas_mut();
                 if let Some(data) = datas.first_mut() {
                     let chunk = data.chunk();
@@ -313,6 +315,7 @@ fn run_pipewire_capture(
                                 data: rgba,
                                 width,
                                 height,
+                                pts,
                             },
                             CaptureMode::Region {
                                 x: rx,
@@ -343,6 +346,7 @@ fn run_pipewire_capture(
                                     data: cropped,
                                     width: rw,
                                     height: rh,
+                                    pts,
                                 }
                             }
                         };
