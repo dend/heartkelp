@@ -601,13 +601,21 @@ impl App {
                     );
                     if resp.clicked() {
                         self.last_error = None;
-                        self.selected_region = None;
-                        self.region_selector.set_initial_region(None);
-                        // Defer screenshot so the compositor has time to
-                        // remove the region highlight viewport first.
+                        // Preload the current selection so the overlay
+                        // shows the existing zone on a fresh screenshot —
+                        // this doubles as "view where my region is", since
+                        // a persistent on-screen outline is impossible
+                        // here (no transparent windows on this stack).
+                        // Escape keeps the selection unchanged.
+                        self.region_selector
+                            .set_initial_region(self.selected_region);
                         self.pending_screenshot = Some(Instant::now());
                     }
-                    resp.on_hover_text("Select Region");
+                    resp.on_hover_text(if self.selected_region.is_some() {
+                        "View / Adjust Region"
+                    } else {
+                        "Select Region"
+                    });
                 } else {
                     ui.painter().rect_filled(
                         rect,

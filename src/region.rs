@@ -240,7 +240,7 @@ impl SelectorState {
         // Handle confirmation delay (close after animation)
         if self.confirmed {
             if let Some(at) = self.confirmed_at {
-                if at.elapsed() > Duration::from_millis(350) {
+                if at.elapsed() > Duration::from_millis(650) {
                     self.selected_region = self.confirmed_region.take();
                     self.close(ctx);
                     return;
