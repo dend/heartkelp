@@ -1924,6 +1924,9 @@ dependencies = [
  "serde",
  "tokio",
  "toml 0.8.23",
+ "wayland-client",
+ "wayland-protocols",
+ "x11rb",
 ]
 
 [[package]]

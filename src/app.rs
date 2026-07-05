@@ -79,6 +79,12 @@ pub struct App {
     last_error: Option<String>,
     screen_size: Option<(u32, u32)>,
     screen_thumb: Option<egui::TextureHandle>,
+    // On-screen dashed outline around the selected region (raw-Wayland
+    // shm overlay; see highlight.rs). Recreated whenever the desired
+    // region changes; None while the selector or its screenshot is active
+    // so the outline never appears inside the selector's screenshot.
+    highlight: Option<crate::highlight::Highlight>,
+    highlight_region: Option<(i32, i32, u32, u32)>,
     use_region: bool,
     paused: bool,
     pause_start: Option<Instant>,
@@ -140,6 +146,8 @@ impl App {
             last_error: None,
             screen_size: None,
             screen_thumb: None,
+            highlight: None,
+            highlight_region: None,
             use_region: false,
             paused: false,
             pause_start: None,
@@ -200,9 +208,11 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
-        // Deferred screenshot: wait for compositor to remove highlight viewport
+        // Deferred screenshot: give the compositor time to unmap the
+        // region-highlight overlay (including its fade-out animation) so
+        // the dashes don't appear in the captured screenshot.
         if let Some(when) = self.pending_screenshot {
-            if when.elapsed() >= Duration::from_millis(150) {
+            if when.elapsed() >= Duration::from_millis(300) {
                 self.pending_screenshot = None;
                 let _ = self.cmd_tx.send(Command::TakeScreenshot);
             } else {
@@ -317,6 +327,31 @@ impl eframe::App for App {
         // Handle state transitions
         if self.state != state_before {
             self.apply_state_transition(ctx, &state_before);
+        }
+
+        // Maintain the on-screen region outline: visible while a region is
+        // selected in idle and during region recording (the dashes sit
+        // outside the crop, so they are never captured). Hidden while the
+        // selector or its screenshot is pending so the outline can't leak
+        // into the selector's background image.
+        let desired_highlight = if self.use_region
+            && !self.region_selector.is_open()
+            && self.pending_screenshot.is_none()
+            && matches!(
+                self.state,
+                RecordingState::Idle | RecordingState::Recording
+            ) {
+            self.selected_region
+        } else {
+            None
+        };
+        if desired_highlight != self.highlight_region {
+            self.highlight_region = desired_highlight;
+            self.highlight = None; // unmap the old overlay first
+            if let Some(region) = desired_highlight {
+                self.highlight =
+                    Some(crate::highlight::Highlight::spawn(region));
+            }
         }
 
         self.region_selector.show(ctx);

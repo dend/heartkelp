@@ -24,6 +24,9 @@ toml = "0.8"
 dirs = "6"
 open = "5"
 libc = "0.2"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+x11rb = "0.13"
 
 [package.metadata.deb]
 maintainer = "Den Delimarsky"

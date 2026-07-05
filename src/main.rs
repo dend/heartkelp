@@ -2,6 +2,7 @@ mod app;
 mod capture;
 mod config;
 mod encoder;
+mod highlight;
 mod region;
 mod types;
 
