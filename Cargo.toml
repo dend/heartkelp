@@ -11,7 +11,10 @@ readme = "README.md"
 [dependencies]
 eframe = "0.33"
 egui = "0.33"
-ashpd = { version = "0.12", default-features = false, features = ["tokio"] }
+# async-std backend, not tokio: zbus features are unified across the crate graph,
+# and zbus/tokio would panic accesskit's AT-SPI thread (no tokio runtime there).
+# The async-io reactor works from any thread, including our backend's block_on.
+ashpd = { version = "0.12", default-features = false, features = ["async-std"] }
 pipewire = "0.9"
 gifski = "1.34"
 rgb = "0.8"
