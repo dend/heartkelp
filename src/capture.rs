@@ -135,7 +135,7 @@ async fn start_recording(
     let pause_flag = Arc::new(AtomicBool::new(false));
 
     // Channel for frames from PipeWire → collector
-    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(4);
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(8);
 
     // Spawn collector thread — accumulates frames for review
     // Sends RecordingStarted on first frame so the UI timer aligns
@@ -145,7 +145,14 @@ async fn start_recording(
     let collector_handle = std::thread::spawn(move || {
         let mut frames = Vec::new();
         let mut index = 0usize;
-        while let Ok(frame) = frame_rx.recv() {
+        while let Ok(mut frame) = frame_rx.recv() {
+            // Frames arrive as raw BGRx rows; swizzle to RGBA here so the
+            // PipeWire process callback stays cheap. The x byte is
+            // undefined, so force alpha opaque.
+            for px in frame.data.chunks_exact_mut(4) {
+                px.swap(0, 2);
+                px[3] = 255;
+            }
             if index == 0 {
                 let _ = collector_event_tx.send(Event::RecordingStarted);
             }
@@ -191,6 +198,18 @@ async fn start_recording(
 
     match collector_handle.join() {
         Ok(frames) => {
+            if let (Some(first), Some(last)) = (frames.first(), frames.last()) {
+                let span = last.pts - first.pts;
+                if span > 0.0 && frames.len() > 1 {
+                    eprintln!(
+                        "heartkelp: captured {} frames over {:.2}s (avg {:.1} fps, target {})",
+                        frames.len(),
+                        span,
+                        (frames.len() - 1) as f64 / span,
+                        fps
+                    );
+                }
+            }
             let _ = event_tx.send(Event::RecordingReady { frames, fps });
             ctx.request_repaint();
         }
@@ -236,124 +255,162 @@ fn run_pipewire_capture(
     let stop2 = stop_flag.clone();
     let pause2 = pause_flag.clone();
     let mode2 = mode.clone();
-    let frame_interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
-    let mut next_frame_time = std::time::Instant::now();
+    // Decimate delivery (at monitor refresh; see the maxFramerate comment on
+    // the format pod) down to the target FPS by scheduled slots: a frame is
+    // accepted if it lands within tolerance of the next slot, and the slot
+    // advances by exactly one interval per accepted frame, so the average
+    // rate locks to the target on any refresh rate. The tolerance (¼
+    // interval) accepts frames that arrive one refresh tick early; without
+    // it, "slightly early" frames get discarded and against tick-quantized
+    // delivery that aliasing drops the rate to a subharmonic — the same bug
+    // mutter's own throttle has (measured: maxFramerate 30/1 on a 59.95 Hz
+    // monitor delivers a steady 20 fps). ¼ interval stays safely below the
+    // half-interval that would let two consecutive refresh ticks through.
+    let interval = 1.0 / fps as f64;
+    let tolerance = interval * 0.25;
+    let mut next_slot = 0.0_f64;
+    let mut dropped = 0usize;
     let record_start = std::time::Instant::now();
 
+    // Negotiated frame dimensions, written by param_changed and read by
+    // process via the listener's shared user data.
+    #[derive(Default)]
+    struct StreamData {
+        width: u32,
+        height: u32,
+    }
+
     let _listener = stream
-        .add_local_listener::<()>()
-        .state_changed(|_stream: &pipewire::stream::Stream, _data: &mut (), _old, new| {
-            if let pipewire::stream::StreamState::Error(ref e) = new {
-                eprintln!("PipeWire stream error: {e}");
+        .add_local_listener::<StreamData>()
+        .state_changed(
+            |_stream: &pipewire::stream::Stream, _data: &mut StreamData, _old, new| {
+                if let pipewire::stream::StreamState::Error(ref e) = new {
+                    eprintln!("PipeWire stream error: {e}");
+                }
+            },
+        )
+        .param_changed(|_stream, negotiated: &mut StreamData, id, param| {
+            let Some(param) = param else { return };
+            if id != pipewire::spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let Ok((media_type, media_subtype)) =
+                pipewire::spa::param::format_utils::parse_format(param)
+            else {
+                return;
+            };
+            if media_type != pipewire::spa::param::format::MediaType::Video
+                || media_subtype != pipewire::spa::param::format::MediaSubtype::Raw
+            {
+                return;
+            }
+            let mut info = pipewire::spa::param::video::VideoInfoRaw::new();
+            if info.parse(param).is_ok() {
+                negotiated.width = info.size().width;
+                negotiated.height = info.size().height;
+                let fr = info.framerate();
+                let max = info.max_framerate();
+                eprintln!(
+                    "heartkelp: negotiated {}x{}, framerate {}/{}, maxFramerate {}/{}",
+                    negotiated.width, negotiated.height, fr.num, fr.denom, max.num, max.denom
+                );
             }
         })
-        .process(move |stream: &pipewire::stream::Stream, _data: &mut ()| {
+        .process(move |stream: &pipewire::stream::Stream, negotiated: &mut StreamData| {
             if stop2.load(Ordering::SeqCst) {
                 return;
             }
 
-            // Dequeue and discard frames while paused
+            // Always dequeue — dropping the Buffer requeues it to PipeWire,
+            // so every early return below still recycles the buffer.
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+
             if pause2.load(Ordering::SeqCst) {
-                let _ = stream.dequeue_buffer();
                 return;
             }
 
-            // Throttle to configured FPS — advance from scheduled
-            // time (not wall clock) to prevent drift accumulation.
-            let now = std::time::Instant::now();
-            if now < next_frame_time {
-                let _ = stream.dequeue_buffer();
+            let pts = record_start.elapsed().as_secs_f64();
+            if pts < next_slot - tolerance {
                 return;
             }
-            next_frame_time += frame_interval;
-            // If we fell far behind (e.g. stall), reset to avoid burst
-            if next_frame_time < now {
-                next_frame_time = now + frame_interval;
+
+            let datas = buffer.datas_mut();
+            let Some(data) = datas.first_mut() else { return };
+            let chunk = data.chunk();
+            let chunk_stride = chunk.stride();
+            let chunk_size = chunk.size() as usize;
+            if chunk_stride <= 0 || chunk_size == 0 {
+                return;
+            }
+            let stride = chunk_stride as usize;
+
+            // Prefer negotiated dimensions; the stride-derived fallback
+            // miscounts when rows are padded, so it is only used if the
+            // Format param has somehow not arrived before buffers.
+            let (width, height) = if negotiated.width > 0 && negotiated.height > 0 {
+                (negotiated.width as usize, negotiated.height as usize)
+            } else {
+                let w = stride / 4;
+                (w, if w > 0 { chunk_size / stride } else { 0 })
+            };
+            if width == 0 || height == 0 {
+                return;
             }
 
-            if let Some(mut buffer) = stream.dequeue_buffer() {
-                let pts = record_start.elapsed().as_secs_f64();
-                let datas = buffer.datas_mut();
-                if let Some(data) = datas.first_mut() {
-                    let chunk = data.chunk();
-                    let stride = chunk.stride();
-                    if stride <= 0 {
-                        return;
+            let Some(slice) = data.data() else { return };
+
+            let (crop_x, crop_y, out_w, out_h) = match &mode2 {
+                CaptureMode::FullScreen => (0usize, 0usize, width, height),
+                CaptureMode::Region { x, y, w, h } => {
+                    let rx = (*x).max(0) as usize;
+                    let ry = (*y).max(0) as usize;
+                    let rw = (*w as usize).min(width.saturating_sub(rx));
+                    let rh = (*h as usize).min(height.saturating_sub(ry));
+                    (rx, ry, rw, rh)
+                }
+            };
+            if out_w == 0 || out_h == 0 {
+                return;
+            }
+
+            // Copy out raw BGRx rows (dropping stride padding, cropping in
+            // place for region mode). This callback must stay cheap — while
+            // it runs, the compositor cannot recycle buffers and starts
+            // dropping frames at the source — so the per-pixel RGBA swizzle
+            // happens on the collector thread instead.
+            let mut bgra = Vec::with_capacity(out_w * out_h * 4);
+            for row in 0..out_h {
+                let src_start = (crop_y + row) * stride + crop_x * 4;
+                let src_end = src_start + out_w * 4;
+                if src_end > slice.len() {
+                    return;
+                }
+                bgra.extend_from_slice(&slice[src_start..src_end]);
+            }
+
+            let frame = Frame {
+                data: bgra,
+                width: out_w as u32,
+                height: out_h as u32,
+                pts,
+            };
+
+            match frame_tx.try_send(frame) {
+                Ok(()) => {
+                    next_slot += interval;
+                    // More than a slot behind (startup, stall, pause) —
+                    // re-anchor instead of burst-accepting to catch up.
+                    if next_slot < pts {
+                        next_slot = pts + interval;
                     }
-                    let stride = stride as u32;
-                    let width = stride / 4;
-                    let height = if width > 0 {
-                        chunk.size() / stride
-                    } else {
-                        0
-                    };
-
-                    if width == 0 || height == 0 {
-                        return;
-                    }
-
-                    if let Some(slice) = data.data() {
-                        // Convert BGRA to RGBA
-                        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-                        for y in 0..height {
-                            let row_start = (y * stride) as usize;
-                            for x in 0..width {
-                                let offset = row_start + (x * 4) as usize;
-                                if offset + 3 < slice.len() {
-                                    let b = slice[offset];
-                                    let g = slice[offset + 1];
-                                    let r = slice[offset + 2];
-                                    let a = slice[offset + 3];
-                                    rgba.extend_from_slice(&[r, g, b, a]);
-                                }
-                            }
-                        }
-
-                        // Crop if region mode
-                        let frame = match &mode2 {
-                            CaptureMode::FullScreen => Frame {
-                                data: rgba,
-                                width,
-                                height,
-                                pts,
-                            },
-                            CaptureMode::Region {
-                                x: rx,
-                                y: ry,
-                                w: rw,
-                                h: rh,
-                            } => {
-                                let rx = (*rx).max(0) as u32;
-                                let ry = (*ry).max(0) as u32;
-                                let rw = (*rw).min(width.saturating_sub(rx));
-                                let rh = (*rh).min(height.saturating_sub(ry));
-
-                                if rw == 0 || rh == 0 {
-                                    return;
-                                }
-
-                                let mut cropped = Vec::with_capacity((rw * rh * 4) as usize);
-                                for cy in 0..rh {
-                                    let src_y = ry + cy;
-                                    let src_start = (src_y * width + rx) as usize * 4;
-                                    let src_end = src_start + (rw as usize * 4);
-                                    if src_end <= rgba.len() {
-                                        cropped.extend_from_slice(&rgba[src_start..src_end]);
-                                    }
-                                }
-
-                                Frame {
-                                    data: cropped,
-                                    width: rw,
-                                    height: rh,
-                                    pts,
-                                }
-                            }
-                        };
-
-                        // Non-blocking send — drop frame if encoder is behind
-                        let _ = frame_tx.try_send(frame);
-                    }
+                }
+                Err(_) => {
+                    // Collector behind; leaving the slot unchanged lets the
+                    // next delivered frame retry immediately.
+                    dropped += 1;
+                    eprintln!("heartkelp: collector busy, dropped frame ({dropped} total)");
                 }
             }
         })
@@ -385,6 +442,41 @@ fn run_pipewire_capture(
                 value: pipewire::spa::pod::Value::Id(pipewire::spa::utils::Id(
                     pipewire::spa::param::video::VideoFormat::BGRx.as_raw(),
                 )),
+            },
+            // framerate 0/1 declares a variable-rate stream; maxFramerate is
+            // left effectively uncapped so mutter delivers at monitor
+            // refresh and OUR slot decimator sets the pace. Do NOT request
+            // the target FPS here: mutter's throttle aliases against the
+            // refresh tick (measured on GNOME 46 @ 59.95 Hz: requesting
+            // 30/1 yields a steady 20 fps), and frames it withholds are
+            // unrecoverable client-side.
+            pipewire::spa::pod::Property {
+                key: pipewire::spa::param::format::FormatProperties::VideoFramerate.as_raw(),
+                flags: pipewire::spa::pod::PropertyFlags::empty(),
+                value: pipewire::spa::pod::Value::Fraction(pipewire::spa::utils::Fraction {
+                    num: 0,
+                    denom: 1,
+                }),
+            },
+            pipewire::spa::pod::Property {
+                key: pipewire::spa::param::format::FormatProperties::VideoMaxFramerate.as_raw(),
+                flags: pipewire::spa::pod::PropertyFlags::empty(),
+                value: pipewire::spa::pod::Value::Choice(
+                    pipewire::spa::pod::ChoiceValue::Fraction(pipewire::spa::utils::Choice(
+                        pipewire::spa::utils::ChoiceFlags::empty(),
+                        pipewire::spa::utils::ChoiceEnum::Range {
+                            default: pipewire::spa::utils::Fraction {
+                                num: 1000,
+                                denom: 1,
+                            },
+                            min: pipewire::spa::utils::Fraction { num: 1, denom: 1 },
+                            max: pipewire::spa::utils::Fraction {
+                                num: 1000,
+                                denom: 1,
+                            },
+                        },
+                    )),
+                ),
             },
         ],
     });

@@ -15,6 +15,8 @@ cargo run
 
 There are no tests yet. Verify changes compile with `cargo build`.
 
+The dev profile pins `opt-level = 1` (deps at 3) in `Cargo.toml` — fully unoptimized builds can't move pixels fast enough to hold the capture frame rate. Don't remove it.
+
 ## Project Structure
 
 ```
@@ -64,7 +66,14 @@ The UI is entirely custom-painted using egui's painter API — no standard widge
 ### pipewire-rs 0.9
 - Use `MainLoopBox::new()`, `ContextBox::new()`, `StreamBox::new()`.
 - `ContextBox::new()` takes `(&Loop, Option<PropertiesBox>)` — pass `mainloop.loop_()`.
-- Stream callbacks: `state_changed` takes 4 params, `process` takes 2.
+- Stream callbacks: `state_changed` takes 4 params, `process` takes 2, `param_changed` takes `(&Stream, &mut D, u32, Option<&Pod>)`. All share one user-data `D` (`add_local_listener::<D: Default>()`).
+- Parse the negotiated format in `param_changed`: `format_utils::parse_format(pod)` then `VideoInfoRaw::new()` + `.parse(pod)` — use its `.size()` for frame dimensions, never `stride/4` (rows can be padded).
+- `Buffer` requeues itself to PipeWire on `Drop`, so early returns after `dequeue_buffer()` are safe.
+
+### Capture pacing (don't regress this)
+- The format pod requests `VideoFramerate` = 0/1 (variable) plus a `VideoMaxFramerate` choice range up to the configured FPS, so mutter paces delivery upstream. Delivery is damage-gated: a static screen produces no buffers, which is why frames carry real `pts` and the encoder must never assume uniform spacing.
+- The only client-side throttle is a min-spacing backstop (75% of the frame interval since the last *accepted* frame). Never throttle by "discard if earlier than the scheduled tick" — against ~FPS-rate delivery that aliases and halves the capture rate.
+- The PipeWire `process` callback must stay cheap (row `memcpy` only). Per-pixel work there stalls buffer recycling and makes the compositor drop frames at the source; the BGRx→RGBA swizzle lives on the collector thread.
 
 ### egui 0.33
 - `ColorImage::new(size, pixels)` — no struct literal construction.

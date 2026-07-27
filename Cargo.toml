@@ -8,6 +8,15 @@ homepage = "https://github.com/dend/heartkelp"
 repository = "https://github.com/dend/heartkelp"
 readme = "README.md"
 
+# Unoptimized dev builds cannot move pixels fast enough to hold the capture
+# frame rate (a 4K frame copy + swizzle exceeds the 33 ms budget at 30 fps),
+# so keep light optimization on for our code and full for dependencies.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
 [dependencies]
 eframe = "0.33"
 egui = "0.33"
