@@ -41,7 +41,7 @@ wayland-protocols = { version = "0.32", features = ["client"] }
 x11rb = "0.13"
 
 [package.metadata.deb]
-maintainer = "Den Delimarsky"
+maintainer = "Den"
 depends = "libpipewire-0.3-0, xdg-desktop-portal"
 section = "utils"
 priority = "optional"
